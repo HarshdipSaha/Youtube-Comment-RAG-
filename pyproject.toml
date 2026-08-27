@@ -42,10 +42,19 @@ Homepage = "https://github.com/HarshdipSaha/Youtube-Comment-RAG-"
 
 [tool.setuptools]
 packages = ["ytrag"]
+# `langchain_helper` is documented as still working, so it has to be importable
+# after install -- not merely present in a checkout. `main.py` is deliberately
+# excluded: it is a Streamlit entry point, and installing a top-level module
+# called `main` would collide with half the world.
+py-modules = ["langchain_helper"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+# So `pytest` works in a fresh checkout without an editable install. Bare
+# `pytest` does not put the working directory on sys.path the way
+# `python -m pytest` does, and that difference hid a real packaging bug.
+pythonpath = ["."]
 filterwarnings = ["ignore::RuntimeWarning:google_crc32c"]
 
 [tool.ruff]
