@@ -58,7 +58,6 @@ class TestExtractiveLLM:
     def test_never_states_a_figure_it_was_not_given(self, evidence):
         """It builds from pipeline output, so hallucinated numbers are impossible."""
         from ytrag.citations import CitationGuard
-        from ytrag.prompt import evidence_numbers
 
         answer = ExtractiveLLM(evidence).complete(SYSTEM_PROMPT, "q")
         allowed_ids = {e.cluster.representative_cid for e in evidence}

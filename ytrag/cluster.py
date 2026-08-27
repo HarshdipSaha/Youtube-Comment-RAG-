@@ -52,13 +52,15 @@ weights below lean towards when the question is about the distribution itself.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
 
+from ytrag.embed import query_tokens
+from ytrag.fusion import reciprocal_rank_fusion
 from ytrag.models import Evidence, OpinionCluster
-from ytrag.store import HybridStore
+from ytrag.store import BM25Index, HybridStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +134,7 @@ def cluster_opinions(
             members.append([i])
 
     clusters: list[OpinionCluster] = []
-    for cluster_id, (leader, group) in enumerate(zip(leaders, members)):
+    for cluster_id, (leader, group) in enumerate(zip(leaders, members, strict=True)):
         group_comments = [store.comments[i] for i in group]
         ranked = sorted(group_comments, key=lambda c: (-c.likes, c.cid))
         clusters.append(
@@ -159,6 +161,76 @@ def _unit(vector: np.ndarray) -> np.ndarray:
     return vector / norm if norm > 0 else vector
 
 
+#: Damping constant for cluster-level rank fusion. Smaller than the usual 60
+#: because there are far fewer clusters than documents, and at k=60 the gap
+#: between rank 1 and rank 4 all but vanishes.
+_CLUSTER_RRF_K = 10
+
+
+def _hybrid_salience(
+    clusters: Sequence[OpinionCluster],
+    store: HybridStore,
+    query: str,
+) -> list[float]:
+    """Relevance of each cluster to ``query``, from both retrievers.
+
+    Dense similarity to the cluster centroid and BM25 over the cluster's
+    concatenated member text are fused by **reciprocal rank fusion**, then
+    scaled against the best cluster.
+
+    Fusing by rank rather than by magnitude is the important part, and it is
+    worth recording why, because the obvious alternative fails. Taking the
+    larger of the two normalised scores looks reasonable and is measurably
+    wrong: asked "who wants to see Luffy fight Buggy" on the sample corpus, the
+    hashed embedder scores the entirely unrelated Vegapunk cluster at 0.23
+    against the correct cluster's 0.292 -- near parity, pure noise -- while BM25
+    scores them 0.0 and 3.83. Any scheme that reads those cosines as magnitudes
+    lets the noise through; scaling them against the best candidate actively
+    amplifies it, turning 0.23-out-of-0.292 into "79% as relevant".
+
+    Rank agreement is robust to exactly that. A cluster both retrievers place
+    near the top outranks one that only the noisy retriever likes, without
+    either having to be calibrated against the other -- which is the property
+    RRF exists for.
+    """
+    if not clusters:
+        return []
+
+    # No content words means no topic to be relevant to. Relevance has no
+    # opinion, and must not impose an arbitrary order on the clusters.
+    if not query_tokens(query):
+        return [1.0] * len(clusters)
+
+    query_vector = store.embedder.encode_query(query)
+    dense = [(c.cluster_id, float(np.dot(c.centroid, query_vector))) for c in clusters]
+    dense_ranking = [
+        cid for cid, score in sorted(dense, key=lambda kv: -kv[1]) if score > 0
+    ]
+
+    lexical_index = BM25Index(
+        [
+            (
+                c.cluster_id,
+                " ".join(
+                    (store.get(cid).text if store.get(cid) else "")
+                    for cid in c.member_cids
+                ),
+            )
+            for c in clusters
+        ]
+    )
+    lexical_ranking = [
+        cid for cid, _ in lexical_index.search(query, limit=len(clusters))
+    ]
+
+    fused = dict(
+        reciprocal_rank_fusion(
+            [lexical_ranking, dense_ranking], k=_CLUSTER_RRF_K
+        )
+    )
+    return _ratio_to_best([fused.get(c.cluster_id, 0.0) for c in clusters])
+
+
 def score_evidence(
     clusters: Sequence[OpinionCluster],
     store: HybridStore,
@@ -174,22 +246,21 @@ def score_evidence(
         return []
 
     similarities = store.similarity_to(query)
-    query_vector = store.embedder.encode_query(query)
     total_comments = max(1, store.total_comments)
     total_likes = max(1, store.total_likes)
 
-    saliences = [float(np.dot(c.centroid, query_vector)) for c in clusters]
+    saliences = _hybrid_salience(clusters, store, query)
     supports = [math.log1p(c.support) for c in clusters]
     endorsements = [math.log1p(c.endorsement) for c in clusters]
 
     # The three signals live on unrelated scales -- cosine is compressed into a
     # narrow band near zero while log-likes saturate -- so mixing them raw lets
     # a large cluster outrank an exactly-on-topic one no matter what gamma says.
-    # Rescaling each within the candidate set makes the weights mean what they
+    # Rescaling each against the best candidate makes the weights mean what they
     # claim: gamma=0.6 really is "relevance decides 60% of the ranking".
-    salience_hat = _rescale(saliences)
-    support_hat = _rescale(supports)
-    endorsement_hat = _rescale(endorsements)
+    salience_hat = _ratio_to_best(saliences)
+    support_hat = _ratio_to_best(supports)
+    endorsement_hat = _ratio_to_best(endorsements)
 
     scored: list[Evidence] = []
     for index, cluster in enumerate(clusters):
@@ -233,18 +304,29 @@ def score_evidence(
     return scored[:limit]
 
 
-def _rescale(values: Sequence[float]) -> list[float]:
-    """Min-max a signal into ``[0, 1]`` across the clusters being ranked.
+def _ratio_to_best(values: Sequence[float]) -> list[float]:
+    """Scale a signal to ``[0, 1]`` as a fraction of the best value present.
 
-    A single cluster, or a set where every cluster ties, scores 1.0 throughout:
-    the signal carries no information here, so it must not veto the others.
+    Deliberately *not* min-max. Min-max maps the weakest candidate to 0 and the
+    second-strongest to roughly 0.5 regardless of the absolute numbers, so a
+    cluster with a cosine of 0.02 against a best of 0.30 comes out at ~0.5 --
+    "half as relevant as the best match" -- when it is not relevant at all.
+    Measured on the sample corpus that was enough for a large off-topic cluster
+    to beat an exactly-on-topic singleton, because a spurious 0.5 relevance
+    multiplied by a real consensus boost outweighed real relevance.
+
+    Dividing by the maximum keeps zero meaning zero: irrelevant stays
+    irrelevant, and only the genuinely comparable get comparable scores.
     """
     if not values:
         return []
-    low, high = min(values), max(values)
-    if high - low < 1e-12:
+    clamped = [max(0.0, v) for v in values]
+    best = max(clamped)
+    if best <= 1e-12:
+        # Nothing matched at all, so relevance has no opinion and must not veto
+        # the social signals.
         return [1.0] * len(values)
-    return [(v - low) / (high - low) for v in values]
+    return [v / best for v in clamped]
 
 
 def coverage(evidence: Sequence[Evidence], store: HybridStore) -> float:

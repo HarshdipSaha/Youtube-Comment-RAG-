@@ -22,7 +22,8 @@ computed rather than described.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from ytrag.models import Evidence
 from ytrag.store import HybridStore

@@ -13,7 +13,7 @@ Cormack, Clarke & Buettcher (SIGIR 2009).
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Hashable, Sequence
+from collections.abc import Hashable, Sequence
 
 
 def reciprocal_rank_fusion(
@@ -40,7 +40,7 @@ def reciprocal_rank_fusion(
         )
 
     scores: dict[Hashable, float] = defaultdict(float)
-    for ranking, weight in zip(rankings, weights):
+    for ranking, weight in zip(rankings, weights, strict=True):
         for position, doc_id in enumerate(ranking):
             scores[doc_id] += weight / (k + position + 1)
 
