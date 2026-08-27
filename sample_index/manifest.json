@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "count": 45,
+  "dim": 512,
+  "embedder": "HashingEmbedder"
+}

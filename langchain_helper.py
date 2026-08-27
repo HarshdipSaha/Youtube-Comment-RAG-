@@ -1,91 +1,71 @@
-from langchain_community.document_loaders.csv_loader import CSVLoader
-import pandas as pd
-import csv
-import os
-from langchain_core.prompts import PromptTemplate
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-sec_key=os.environ["HUGGINGFACEHUB_API_TOKEN"] 
-from langchain_huggingface import HuggingFaceEndpoint
+"""Backwards-compatible shim for the original module's two functions.
 
-from youtube_comment_downloader import YoutubeCommentDownloader, SORT_BY_POPULAR
-from langchain_community.embeddings import HuggingFaceInstructEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-import google.generativeai as genai
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro-latest",google_api_key=apikey)
+The original ``langchain_helper`` could not be imported at all: line 15 read
 
-from langchain_core.prompts.prompt import PromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.vectorstores import FAISS
-vectordb_file_path = "faiss_index"
-instructor_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-large")
+    llm = ChatGoogleGenerativeAI(model=..., google_api_key=apikey)
+
+with ``apikey`` never defined, so ``import langchain_helper`` raised
+``NameError`` before anything ran. It also read ``HUGGINGFACEHUB_API_TOKEN``
+with ``os.environ[...]`` at import time, raising ``KeyError`` on any machine
+without one, and loaded the CSV from a hard-coded
+``H:\\data science roadmap\\langchain\\youtubeproj\\`` path.
+
+The two public functions are preserved here so existing scripts keep working,
+implemented on top of :mod:`ytrag`. New code should use :class:`ytrag.CommentRAG`
+directly -- it returns evidence, coverage and citations, which this interface
+has no way to express.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Any
+
+from ytrag.engine import DEFAULT_INDEX, CommentRAG
+from ytrag.llm import get_llm
+
+vectordb_file_path = DEFAULT_INDEX
 
 
-def create_vector_db(Url):
-    url = Url  # Replace with your YouTube URL
-    downloader = YoutubeCommentDownloader()
-    comments = downloader.get_comments_from_url(url, sort_by=SORT_BY_POPULAR)
+def create_vector_db(Url: str, limit: int = 500, path: str = DEFAULT_INDEX) -> CommentRAG:
+    """Download a video's comments and save a knowledge base.
 
-    # Open a CSV file to write the comments
-    try:
-        with open('youtube_comments.csv', mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Merged Comment'])  # Single header for the merged column
+    Unlike the original, this raises on failure instead of printing the
+    exception and continuing on to index a file that was never written.
+    """
+    rag = CommentRAG.from_youtube(Url, limit=limit)
+    rag.save(path)
+    return rag
 
-            for idx, comment in enumerate(comments, start=1):
-                text = comment['text']
-                likes = comment['votes']
-                user_id = comment['author']
-                published_at = comment['time']
 
-                # Merge all columns into a single column with the specified format
-                merged_comment = f"comment is '{text}' with likes= {likes} with user_id '{user_id}' and published(time)  '{published_at}'"
+class _ChainShim:
+    """Mimics the LangChain ``.invoke({"input": ...})`` -> ``{"answer": ...}`` contract."""
 
-                writer.writerow([merged_comment])
-    except Exception as ex:
-        print(ex)   
-    loader= CSVLoader(file_path='H:\data science roadmap\langchain\youtubeproj\youtube_comments.csv',encoding="utf-8")
+    def __init__(self, rag: CommentRAG) -> None:
+        self.rag = rag
 
-# Store the loaded data in the 'data' variable
-    data = loader.load()
-    instructor_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-large")
+    def invoke(self, payload: dict[str, Any]) -> dict[str, Any]:
+        answer = self.rag.ask(payload.get("input", ""))
+        return {
+            "input": answer.question,
+            "answer": answer.text,
+            "context": [e.cluster.representative_text for e in answer.evidence],
+            "coverage": answer.coverage,
+            "citations": answer.citations,
+        }
 
-# Create a FAISS instance for vector database from 'data'
-    vectordb = FAISS.from_documents(documents=data,
-                                 embedding=instructor_embeddings)
-    vectordb.save_local(vectordb_file_path)
-    
-def get_qa_chain():
-    
-    vectordb = FAISS.load_local(vectordb_file_path, instructor_embeddings,allow_dangerous_deserialization=True)
-    retriever = vectordb.as_retriever(score_threshold=0.7)
-    
-    repo_id = "mistralai/Mistral-7B-Instruct-v0.2"
-    llm = HuggingFaceEndpoint(repo_id=repo_id, max_length=20, temperature=0.7, token=sec_key)
-    system_prompt = (
-        "Use the given context to answer the question. "
-        "If you don't know the answer, return the most nearest answer. "
-        "In the context , details of content of comment start from 'comment is', details of number of likes(integer type) is starting from 'with likes' then the number of likes(integer),then we have userid(who posted) and its time(date) of publish "
-        "Context: {context}"
-     )
 
-    # Define the prompt template
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            ("human", "{input}"),
-        ]
+def get_qa_chain(path: str = DEFAULT_INDEX, llm_backend: str | None = None) -> _ChainShim:
+    """Load a saved knowledge base and return an invokable chain."""
+    warnings.warn(
+        "langchain_helper is a compatibility shim; use ytrag.CommentRAG for "
+        "evidence, coverage and citations.",
+        DeprecationWarning,
+        stacklevel=2,
     )
-    question_answer_chain = create_stuff_documents_chain(llm, prompt)
-    chain = create_retrieval_chain(retriever, question_answer_chain)
-    
-    return chain
+    return _ChainShim(CommentRAG.load(path, llm=get_llm(llm_backend)))
 
 
 if __name__ == "__main__":
-    
     chain = get_qa_chain()
-  
- 
+    print(chain.invoke({"input": "which comment has the most likes?"})["answer"])

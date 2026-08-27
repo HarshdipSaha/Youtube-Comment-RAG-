@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytrag"
+version = "1.0.0"
+description = "Consensus-aware retrieval over YouTube comments"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Harshdip Saha" }]
+keywords = ["rag", "youtube", "comments", "retrieval", "nlp"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Text Processing :: Linguistic",
+]
+
+# numpy is the only hard dependency. Everything else is opt-in, so `pip install
+# ytrag` gives you a working retrieval engine without pulling a deep-learning
+# stack you may not need.
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.30", "matplotlib>=3.7"]
+youtube = ["youtube-comment-downloader>=0.1.68"]
+semantic = ["sentence-transformers>=2.5"]
+llm = ["anthropic>=0.40", "openai>=1.40", "huggingface_hub>=0.24"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.6"]
+all = [
+    "streamlit>=1.30", "matplotlib>=3.7", "youtube-comment-downloader>=0.1.68",
+    "sentence-transformers>=2.5", "anthropic>=0.40", "openai>=1.40",
+    "huggingface_hub>=0.24",
+]
+
+[project.scripts]
+ytrag = "ytrag.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/HarshdipSaha/Youtube-Comment-RAG-"
+
+[tool.setuptools]
+packages = ["ytrag"]
+# `langchain_helper` is documented as still working, so it has to be importable
+# after install -- not merely present in a checkout. `main.py` is deliberately
+# excluded: it is a Streamlit entry point, and installing a top-level module
+# called `main` would collide with half the world.
+py-modules = ["langchain_helper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+# So `pytest` works in a fresh checkout without an editable install. Bare
+# `pytest` does not put the working directory on sys.path the way
+# `python -m pytest` does, and that difference hid a real packaging bug.
+pythonpath = ["."]
+filterwarnings = ["ignore::RuntimeWarning:google_crc32c"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["ytrag"]
+omit = ["ytrag/cli.py"]
