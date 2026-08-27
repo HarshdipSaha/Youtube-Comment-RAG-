@@ -1,0 +1,260 @@
+"""Consensus-Weighted Retrieval (CWR).
+
+Ordinary RAG retrieves the top-k *chunks* nearest a query. Over a comment
+section that is the wrong unit of evidence, for two reasons:
+
+1. **Redundancy.** If 200 people make the same point, top-k returns five
+   near-identical copies of it and the remaining 195 are invisible. The model
+   sees five documents and has no way to know whether that view is universal or
+   fringe.
+2. **Proportion.** "What do people think of this video?" is a question about a
+   *distribution*. No individual comment answers it.
+
+CWR retrieves **opinion clusters** instead. Each cluster carries the social
+proof behind it -- how many people said it (``support``) and how many likes
+those comments drew (``endorsement``) -- so the prompt can state that a view is
+held by 38% of commenters rather than quoting four chunks and hoping.
+
+Clusters are ranked by
+
+    score(C, q) = relevance(C, q) × social(C)
+
+    relevance(C, q) = (1 - γ) + γ·saliencẽ(C, q)
+    social(C)       = 1 + α·support̃(C) + β·endorsement̃(C)
+
+Social proof **multiplies** relevance rather than adding to it, and that choice
+is the whole point. Under an additive score a sufficiently popular cluster wins
+every query, including ones it has nothing to do with -- ask about a minor
+character and you get handed the video's most-liked joke. Multiplying makes an
+irrelevant cluster score near zero no matter how many likes it carries, while
+among clusters that *are* relevant the widely-held view rises. Relevance decides
+*whether*; consensus decides *which*.
+
+The three inputs are log-damped (so one enormous "first!" cluster cannot win on
+bulk alone) and then rescaled into ``[0, 1]`` across the candidates:
+
+    salience(C, q)  = cosine between q and the cluster centroid
+    support(C)      = log(1 + |C|)
+    endorsement(C)  = log(1 + Σ likes)
+
+Salience is measured against the **centroid** rather than the best-matching
+member, because taking a maximum over members is not size-neutral: a cluster of
+six gets six draws at that maximum and a cluster of three gets three, so the
+larger group scores higher on noise alone. Since support and endorsement
+already reward size deliberately, letting salience reward it accidentally as
+well double-counts it. One vector per cluster, whatever its size.
+
+γ controls how much relevance narrows the field: at γ=1 an off-topic cluster is
+annihilated, at γ=0 relevance is ignored entirely, which is what the CONSENSUS
+weights below lean towards when the question is about the distribution itself.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+
+from ytrag.models import Evidence, OpinionCluster
+from ytrag.store import HybridStore
+
+
+@dataclass(frozen=True, slots=True)
+class ConsensusWeights:
+    """Mixing weights for the three ranking signals.
+
+    The defaults keep relevance in charge (γ=0.6). :mod:`ytrag.router` swaps in
+    consensus-heavy weights for questions that are actually about the
+    distribution of opinion rather than about a topic.
+    """
+
+    #: How sharply relevance narrows the field; must stay within [0, 1] since
+    #: it is used as a mixing fraction, not an unbounded coefficient.
+    salience: float = 0.6
+    support: float = 0.2
+    endorsement: float = 0.2
+
+    def validate(self) -> None:
+        if self.salience < 0 or self.support < 0 or self.endorsement < 0:
+            raise ValueError("consensus weights must be non-negative")
+        if self.salience > 1:
+            raise ValueError("salience weight is a fraction and must not exceed 1")
+        if self.salience + self.support + self.endorsement <= 0:
+            raise ValueError("at least one consensus weight must be greater than zero")
+
+
+CONSENSUS_WEIGHTS = ConsensusWeights(salience=0.25, support=0.4, endorsement=0.35)
+"""Weights for 'what does everyone think' questions: proportion over relevance."""
+
+
+def cluster_opinions(
+    store: HybridStore,
+    threshold: float | None = None,
+    max_quotes: int = 5,
+) -> list[OpinionCluster]:
+    """Group comments that say substantially the same thing.
+
+    Uses greedy leader clustering, walking comments in descending like order.
+    Two properties follow from that ordering and both are wanted:
+
+    * the most-endorsed comment in a group becomes its leader, so the quote
+      shown to the user is the one the crowd actually upvoted;
+    * the result is deterministic, unlike k-means with a random seed.
+
+    ``threshold`` defaults to the embedder's own recommendation, because a
+    cosine of 0.4 means something different for hashed n-grams than it does for
+    a trained sentence encoder.
+    """
+    if threshold is None:
+        threshold = getattr(store.embedder, "cluster_threshold", 0.5)
+
+    order = sorted(
+        range(store.total_comments),
+        key=lambda i: (-store.comments[i].likes, store.cids[i]),
+    )
+    vectors = store.vectors
+    leaders: list[int] = []
+    members: list[list[int]] = []
+
+    for i in order:
+        best_leader = -1
+        best_similarity = -np.inf
+        for slot, leader in enumerate(leaders):
+            similarity = float(vectors[i] @ vectors[leader])
+            if similarity > best_similarity:
+                best_similarity, best_leader = similarity, slot
+        if best_leader >= 0 and best_similarity >= threshold:
+            members[best_leader].append(i)
+        else:
+            leaders.append(i)
+            members.append([i])
+
+    clusters: list[OpinionCluster] = []
+    for cluster_id, (leader, group) in enumerate(zip(leaders, members)):
+        group_comments = [store.comments[i] for i in group]
+        ranked = sorted(group_comments, key=lambda c: (-c.likes, c.cid))
+        clusters.append(
+            OpinionCluster(
+                cluster_id=cluster_id,
+                member_cids=[c.cid for c in ranked],
+                representative_cid=store.comments[leader].cid,
+                representative_text=store.comments[leader].text
+                or store.comments[leader].emojis,
+                support=len(group),
+                endorsement=sum(c.likes for c in group_comments),
+                valence=float(np.mean([c.valence for c in group_comments])),
+                centroid=_unit(vectors[group].mean(axis=0)),
+                exemplar_cids=[c.cid for c in ranked[:max_quotes]],
+            )
+        )
+    return clusters
+
+
+def _unit(vector: np.ndarray) -> np.ndarray:
+    """L2-normalise, so a centroid can be compared by plain dot product."""
+    vector = np.asarray(vector, dtype=np.float32)
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0 else vector
+
+
+def score_evidence(
+    clusters: Sequence[OpinionCluster],
+    store: HybridStore,
+    query: str,
+    weights: ConsensusWeights | None = None,
+    limit: int = 6,
+    max_quotes: int = 3,
+) -> list[Evidence]:
+    """Rank clusters for ``query`` and attach the social proof behind each."""
+    weights = weights or ConsensusWeights()
+    weights.validate()
+    if not clusters:
+        return []
+
+    similarities = store.similarity_to(query)
+    query_vector = store.embedder.encode_query(query)
+    total_comments = max(1, store.total_comments)
+    total_likes = max(1, store.total_likes)
+
+    saliences = [float(np.dot(c.centroid, query_vector)) for c in clusters]
+    supports = [math.log1p(c.support) for c in clusters]
+    endorsements = [math.log1p(c.endorsement) for c in clusters]
+
+    # The three signals live on unrelated scales -- cosine is compressed into a
+    # narrow band near zero while log-likes saturate -- so mixing them raw lets
+    # a large cluster outrank an exactly-on-topic one no matter what gamma says.
+    # Rescaling each within the candidate set makes the weights mean what they
+    # claim: gamma=0.6 really is "relevance decides 60% of the ranking".
+    salience_hat = _rescale(saliences)
+    support_hat = _rescale(supports)
+    endorsement_hat = _rescale(endorsements)
+
+    scored: list[Evidence] = []
+    for index, cluster in enumerate(clusters):
+        salience = saliences[index]
+        relevance = (1.0 - weights.salience) + weights.salience * salience_hat[index]
+        social = (
+            1.0
+            + weights.support * support_hat[index]
+            + weights.endorsement * endorsement_hat[index]
+        )
+        score = relevance * social
+        # Quotes are chosen by how well each member answers *this* question,
+        # while the cluster as a whole is ranked by its centroid. Both are
+        # wanted: an honest ranking, and the most pertinent thing anyone in
+        # that camp actually said.
+        on_topic = sorted(
+            cluster.exemplar_cids,
+            key=lambda cid: (-similarities.get(cid, 0.0), cid),
+        )
+        quotes = [
+            text
+            for text in (
+                (store.get(cid).text or store.get(cid).emojis)
+                for cid in on_topic[:max_quotes]
+            )
+            if text
+        ] or [cluster.representative_text]
+
+        scored.append(
+            Evidence(
+                cluster=cluster,
+                salience=float(salience),
+                score=float(score),
+                support_share=cluster.support / total_comments,
+                endorsement_share=cluster.endorsement / total_likes,
+                quotes=quotes,
+            )
+        )
+
+    scored.sort(key=lambda e: (-e.score, e.cluster.cluster_id))
+    return scored[:limit]
+
+
+def _rescale(values: Sequence[float]) -> list[float]:
+    """Min-max a signal into ``[0, 1]`` across the clusters being ranked.
+
+    A single cluster, or a set where every cluster ties, scores 1.0 throughout:
+    the signal carries no information here, so it must not veto the others.
+    """
+    if not values:
+        return []
+    low, high = min(values), max(values)
+    if high - low < 1e-12:
+        return [1.0] * len(values)
+    return [(v - low) / (high - low) for v in values]
+
+
+def coverage(evidence: Sequence[Evidence], store: HybridStore) -> float:
+    """Share of the corpus the selected evidence speaks for.
+
+    Reported alongside every answer. A confident-sounding answer built from 2%
+    of the comments is a different object from one built from 80%, and the user
+    is entitled to know which they were handed.
+    """
+    if not evidence or store.total_comments == 0:
+        return 0.0
+    seen = {cid for e in evidence for cid in e.cluster.member_cids}
+    return len(seen) / store.total_comments
