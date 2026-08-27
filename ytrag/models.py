@@ -10,7 +10,7 @@ view is held.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 QueryKind = Literal["AGGREGATE", "SEMANTIC", "CONSENSUS", "HYBRID"]

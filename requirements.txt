@@ -1,0 +1,17 @@
+# Core engine (this is all you need to run the retrieval pipeline offline).
+numpy>=1.24
+
+# Streamlit UI and charts:  pip install -r requirements.txt
+streamlit>=1.30
+matplotlib>=3.7
+
+# Fetching comments from YouTube
+youtube-comment-downloader>=0.1.68
+
+# Optional: better retrieval quality (downloads a model on first use)
+# sentence-transformers>=2.5
+
+# Optional: generated prose instead of the built-in extractive answers
+# anthropic>=0.40
+# openai>=1.40
+# huggingface_hub>=0.24

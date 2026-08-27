@@ -26,8 +26,8 @@ that does not say which one it made is asking to be over-trusted.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from ytrag.aggregate import AggregateEngine
 from ytrag.citations import CitationGuard
@@ -70,7 +70,7 @@ class CommentRAG:
         embedder: Embedder | None = None,
         llm: LLM | None = None,
         cluster_threshold: float | None = None,
-    ) -> "CommentRAG":
+    ) -> CommentRAG:
         embedder = embedder or get_embedder("hashing")
         return cls(HybridStore.build(comments, embedder), llm, cluster_threshold)
 
@@ -81,7 +81,7 @@ class CommentRAG:
         limit: int = 500,
         embedder: Embedder | None = None,
         llm: LLM | None = None,
-    ) -> "CommentRAG":
+    ) -> CommentRAG:
         return cls.from_comments(from_youtube(url, limit=limit), embedder, llm)
 
     @classmethod
@@ -90,13 +90,13 @@ class CommentRAG:
         path: str | Path,
         embedder: Embedder | None = None,
         llm: LLM | None = None,
-    ) -> "CommentRAG":
+    ) -> CommentRAG:
         return cls.from_comments(from_csv(path), embedder, llm)
 
     @classmethod
     def from_records(
         cls, records, embedder: Embedder | None = None, llm: LLM | None = None
-    ) -> "CommentRAG":
+    ) -> CommentRAG:
         return cls.from_comments(from_records(records), embedder, llm)
 
     @classmethod
@@ -105,7 +105,7 @@ class CommentRAG:
         path: str | Path = DEFAULT_INDEX,
         embedder: Embedder | None = None,
         llm: LLM | None = None,
-    ) -> "CommentRAG":
+    ) -> CommentRAG:
         embedder = embedder or get_embedder("hashing")
         return cls(HybridStore.load(path, embedder), llm)
 

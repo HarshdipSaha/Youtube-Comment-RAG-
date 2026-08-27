@@ -11,12 +11,12 @@ import json
 import math
 import sqlite3
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Iterable, Sequence
 
 import numpy as np
 
-from ytrag.embed import Embedder, tokenize
+from ytrag.embed import Embedder, query_tokens, tokenize
 from ytrag.fusion import reciprocal_rank_fusion
 from ytrag.models import Comment
 
@@ -73,7 +73,9 @@ class BM25Index:
 
     def search(self, query: str, limit: int = 10) -> list[tuple[str, float]]:
         """Return ``(doc_id, score)`` for documents sharing a term with ``query``."""
-        query_terms = [t for t in tokenize(query) if t in self._idf]
+        # Query-side stopword removal, for the same reason the embedder does it:
+        # BM25's idf also rates question words as informative in a comment corpus.
+        query_terms = [t for t in query_tokens(query) if t in self._idf]
         if not query_terms or not self.doc_ids:
             return []
 
@@ -113,7 +115,7 @@ class HybridStore:
     # -- construction -----------------------------------------------------
 
     @classmethod
-    def build(cls, comments: Sequence[Comment], embedder: Embedder) -> "HybridStore":
+    def build(cls, comments: Sequence[Comment], embedder: Embedder) -> HybridStore:
         comments = list(comments)
         if not comments:
             raise ValueError("cannot build a store with no comments")
@@ -192,7 +194,7 @@ class HybridStore:
         """Cosine similarity of every comment to ``query``, keyed by cid."""
         query_vector = self.embedder.encode_query(query)
         similarities = self.vectors @ query_vector
-        return {cid: float(s) for cid, s in zip(self.cids, similarities)}
+        return {cid: float(s) for cid, s in zip(self.cids, similarities, strict=True)}
 
     # -- persistence ------------------------------------------------------
 
@@ -218,7 +220,7 @@ class HybridStore:
         return path
 
     @classmethod
-    def load(cls, path: str | Path, embedder: Embedder) -> "HybridStore":
+    def load(cls, path: str | Path, embedder: Embedder) -> HybridStore:
         path = Path(path)
         manifest_path = path / _MANIFEST
         if not manifest_path.exists():

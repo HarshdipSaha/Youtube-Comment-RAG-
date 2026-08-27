@@ -15,8 +15,9 @@ from __future__ import annotations
 import csv
 import re
 import sys
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any
 
 from ytrag.models import Comment
 from ytrag.normalize import normalize_comment
