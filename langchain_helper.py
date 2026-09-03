@@ -3,9 +3,10 @@ import pandas as pd
 import csv
 import os
 from langchain_core.prompts import PromptTemplate
-sec_key = "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"
+sec_key = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
 
-os.environ["HUGGINGFACEHUB_API_TOKEN"] = sec_key
+if sec_key:
+    os.environ["HUGGINGFACEHUB_API_TOKEN"] = sec_key
 from langchain_huggingface import HuggingFaceEndpoint
 
 from youtube_comment_downloader import YoutubeCommentDownloader, SORT_BY_POPULAR
@@ -24,11 +25,19 @@ from langchain_community.vectorstores import FAISS
 vectordb_file_path = "faiss_index"
 instructor_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-large")
 
+import time
 
-def create_vector_db(Url):
+def create_vector_db(Url, progress_callback=None):
     url = Url  # Replace with your YouTube URL
     downloader = YoutubeCommentDownloader()
+    
+    if progress_callback:
+        progress_callback(10)  # Update progress to 10%
+
     comments = downloader.get_comments_from_url(url, sort_by=SORT_BY_POPULAR)
+
+    if progress_callback:
+        progress_callback(30)  # Update progress to 30%
 
     # Open a CSV file to write the comments
     try:
@@ -44,21 +53,25 @@ def create_vector_db(Url):
 
                 # Merge all columns into a single column with the specified format
                 merged_comment = f"comment is '{text}' with likes= {likes} with user_id '{user_id}' and published(time)  '{published_at}'"
-
                 writer.writerow([merged_comment])
     except Exception as ex:
-        print(ex)   
-    loader= CSVLoader(file_path='H:\data science roadmap\langchain\youtubeproj\youtube_comments.csv',encoding="utf-8")
+        print(ex)
 
-# Store the loaded data in the 'data' variable
+    if progress_callback:
+        progress_callback(60)  # Update progress to 60%
+
+    loader = CSVLoader(file_path='youtube_comments.csv', encoding="utf-8")
     data = loader.load()
-    instructor_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-large")
 
-# Create a FAISS instance for vector database from 'data'
-    vectordb = FAISS.from_documents(documents=data,
-                                 embedding=instructor_embeddings)
-    vectordb.save_local(vectordb_file_path)
-    
+    if progress_callback:
+        progress_callback(80)  # Update progress to 80%
+
+    instructor_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-large")
+    vectordb = FAISS.from_documents(documents=data, embedding=instructor_embeddings)
+    vectordb.save_local('vectordb_file_path')  # Specify your file path here
+
+    if progress_callback:
+        progress_callback(100)  # Update progress to 100%
 def get_qa_chain():
     
     vectordb = FAISS.load_local(vectordb_file_path, instructor_embeddings,allow_dangerous_deserialization=True)
@@ -68,6 +81,7 @@ def get_qa_chain():
     llm = HuggingFaceEndpoint(repo_id=repo_id, max_length=20, temperature=0.7, token=sec_key)
     system_prompt = (
         "Use the given context to answer the question. "
+        
         "If you don't know the answer, return the most nearest answer. "
         "In the context , details of content of comment start from 'comment is', details of number of likes(integer type) is starting from 'with likes' then the number of likes(integer),then we have userid(who posted) and its time(date) of publish "
         "Context: {context}"
